@@ -63,25 +63,31 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     global_adj = np.maximum(global_adj, global_adj.T) 
     
     # PASO 2.5: Transformación a Grafo SNN (Similitud de Jaccard)
+    # Incluimos los self-loops temporalmente para que un nodo sea parte de su propio vecindario
     np.fill_diagonal(global_adj, 1.0)
     
     # Calculamos la intersección de vecindarios (A @ A.T)
     intersection = np.dot(global_adj, global_adj.T)
     degrees = global_adj.sum(axis=1)
     
+    # Calculamos la unión usando broadcasting
     union = degrees[:, np.newaxis] + degrees[np.newaxis, :] - intersection
     
+    # Similitud de Jaccard = Intersección / Unión
     with np.errstate(divide='ignore', invalid='ignore'):
         snn_jaccard = np.where(union > 0, intersection / union, 0.0)
     
+    # Poda (Thresholding) de las aristas débiles
     snn_jaccard[snn_jaccard < jaccard_threshold] = 0.0
     
+    # Removemos la diagonal para evitar que los auto-bucles afecten a Leiden
     np.fill_diagonal(snn_jaccard, 0.0)
     
     # PASO 3: Co-clustering (Leiden) sobre el grafo ponderado SNN
     # Usamos Weighted_Adjacency para que igraph asimile la matriz con ponderaciones reales
     G = ig.Graph.Weighted_Adjacency(snn_jaccard.tolist(), mode=ig.ADJ_UNDIRECTED)
     
+    # Extraemos los pesos de las aristas para inyectarlos en Leiden
     weights = G.es["weight"]
     particion = la.find_partition(G, la.ModularityVertexPartition, weights=weights)
     clusters = particion.membership
@@ -89,11 +95,13 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     # PASO 4: Visualización biMAP (UMAP)
     # Convertimos la matriz de similitud SNN en una matriz de distancias (Distancia = 1 - Similitud)
     dist_matrix = 1.0 - snn_jaccard
-    np.fill_diagonal(dist_matrix, 0.0)
+    np.fill_diagonal(dist_matrix, 0.0) # La distancia hacia sí mismo es 0
     
+    # Configuramos UMAP para recibir directamente la matriz de distancias precalculada
     reducer = umap.UMAP(n_neighbors=k_neighbors, min_dist=0.1, metric='precomputed')
     embedding_2d = reducer.fit_transform(dist_matrix)
     
+    # Plotting (Sin cambios)
     plt.figure(figsize=(10, 8))
     
     emb_est = embedding_2d[:n_est]
@@ -119,14 +127,16 @@ df = pd.read_csv("D:/UCSP/Proyecto_final_de_carrera/Posibles_papers/a_implementa
 
 df['date'] = pd.to_datetime(df['date'])
 
+# Pivotear la tabla para armar la Matriz Espaciotemporal
 # Filas = 'cp' (Espacio), Columnas = 'date' (Tiempo), Valores = 'max_NO2max'
 matriz_df = df.pivot(index='cp', columns='date', values='max_NO2max')
 
 
 # 1. Prioridad: Imputar con la media de cada estación (fila) a lo largo del tiempo.
+# Esto asume que el comportamiento en un día faltante se asemeja al promedio de ese sensor.
 matriz_df = matriz_df.apply(lambda row: row.fillna(row.mean()), axis=1)
 
-# 2. Respaldo de seguridad: 
+# 2. Respaldo de seguridad: Si alguna estación tuviera 100% de NaNs (sin datos), 
 # la media de la fila también sería NaN. Para evitar que el SVD falle, 
 # imputamos cualquier NaN restante con la media general de toda la matriz.
 if matriz_df.isna().sum().sum() > 0:
@@ -149,12 +159,15 @@ n_estaciones = len(estaciones_nombres)
 clust_est = clusters[:n_estaciones]
 clust_dias = clusters[n_estaciones:]
 
-
+# Reordenar la matriz original (para el panel "ANTES")
+# Obtenemos los índices que ordenarían las estaciones y días por su número de clúster
 idx_est_ordenados = np.argsort(clust_est)
 idx_dias_ordenados = np.argsort(clust_dias)
 
+# Aplicamos el reordenamiento a la matriz (esto agrupa visualmente los bloques)
 matriz_reordenada = X_matrix_real[idx_est_ordenados, :][:, idx_dias_ordenados]
 
+# Configurar el lienzo para la comparación (1 fila, 2 columnas)
 fig, axes = plt.subplots(1, 2, figsize=(20, 8))
 
 # PANEL IZQUIERDO:
