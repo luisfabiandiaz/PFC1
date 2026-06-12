@@ -115,17 +115,33 @@ class BBAC_I:
 
 # PASO 1: Carga y Preparación de Datos Reales
 
-df = pd.read_csv('D:/UCSP\Proyecto_final_de_carrera/Posibles_papers/a_implementar/AirQualityPACA_Data-master/data_polmet.csv', sep=';', decimal=',')
+df = pd.read_csv("D:/UCSP/Proyecto_final_de_carrera/Posibles_papers/a_implementar/DATA_sintetica/experimento_base_4x5.csv", 
+                 sep=";", 
+                 dtype={'cp': str}, 
+                 low_memory=False)
+
 
 # 1.2 Crear la matriz de co-ocurrencia (Pivot Table)
-# Filas: Regiones ('cp')
-# Columnas: Tiempos ('date')
-# Valores: Escoge una variable, por ejemplo 'max_NO2max'
-matriz_df = df.pivot_table(index='cp', columns='date', values='max_NO2max', aggfunc='mean')
+matriz_df = df.pivot_table(index='cp', columns='date', values='valor_sintetico', aggfunc='mean')
 
-# 1.3 Limpieza de datos
-matriz_df = matriz_df.fillna(0)
+# 1.3 Imputar con la media de cada estación (fila) a lo largo del tiempo.
+matriz_df = matriz_df.apply(lambda row: row.fillna(row.mean()), axis=1)
 
+#Extraer el Ground Truth alineado exactamente con el orden del pivoteo
+cp_to_gt = df.set_index('cp')['gt_espacial'].to_dict()
+filas_real = np.array([cp_to_gt[cp] for cp in matriz_df.index])
+
+date_to_gt = df.set_index('date')['gt_temporal'].to_dict()
+columnas_real = np.array([date_to_gt[str(dt)] for dt in matriz_df.columns])
+
+# 1.3.2. Respaldo de seguridad: Si alguna estación tuviera 100% de NaNs.
+if matriz_df.isna().sum().sum() > 0:
+    media_global = matriz_df.mean().mean()
+    matriz_df = matriz_df.fillna(media_global)
+
+print(f"Valores nulos después de imputar: {matriz_df.isna().sum().sum()}")
+
+# Preparar variables para el modelo
 X = matriz_df.values
 nombres_regiones = matriz_df.index.astype(str).tolist()
 nombres_tiempos = matriz_df.columns.astype(str).tolist()
@@ -133,60 +149,70 @@ nombres_tiempos = matriz_df.columns.astype(str).tolist()
 num_regiones, num_tiempos = X.shape
 print(f"Matriz creada: {num_regiones} regiones x {num_tiempos} tiempos.")
 
-# PASO 2: Spectral Biclustering
-
 # PASO 2: Co-Clustering Checkerboard con BBAC_I
 
-n_row_clusters = min(8, num_regiones) 
-n_col_clusters = min(4, num_tiempos)
+n_row_clusters = min(10, num_regiones) 
+n_col_clusters = min(12, num_tiempos)
 
-# Instanciamos nuestra clase personalizada
-# Usamos n_init=10 para no demorar mucho probando, luego súbelo a 200
 model = BBAC_I(n_row_clusters=n_row_clusters, 
                n_col_clusters=n_col_clusters, 
-               n_init=200, 
+               n_init=20, 
                max_iter=2000, 
                tol=1e-6)
 
 model.fit(X)
 print(f"Mejor pérdida de I-divergencia alcanzada: {model.best_loss_:.4f}")
 
+# PASO 3: Extracción de características de la matriz comprimida M para K-means
 
-# PASO 3: Extracción de características y K-means
+M_optima = model._calculate_block_averages(X, model.row_labels_, model.column_labels_)
 block_features = []
 
+# Iteramos estrictamente sobre la cuadrícula de co-clusters (k x l)
 for r in range(n_row_clusters):
     for c in range(n_col_clusters):
+        # La media es directamente el valor representativo del bloque en M
+        media = M_optima[r, c]
+        
+        # Para la desviación estándar, calculamos la dispersión de los elementos 
+        # de la matriz reconstruida pertenecientes a este bloque.
         filas_bloque = np.where(model.row_labels_ == r)[0]
         cols_bloque = np.where(model.column_labels_ == c)[0]
         
-        datos_bloque = X[np.ix_(filas_bloque, cols_bloque)]
-        
-        if datos_bloque.size > 0:
-            media = np.mean(datos_bloque)
-            std = np.std(datos_bloque)
+        if len(filas_bloque) > 0 and len(cols_bloque) > 0:
+            # Reconstruimos la porción aproximada del bloque C(R_hat, T_hat)
+            bloque_comprimido = np.full((len(filas_bloque), len(cols_bloque)), media)
+            std = np.std(bloque_comprimido)                                         
         else:
-            media, std = 0, 0
+            std = 0
             
         block_features.append([media, std])
 
 block_features = np.array(block_features)
+
+print(f"Matriz de características generada para K-means: {block_features.shape} (debe ser {n_row_clusters * n_col_clusters} x 2)")
 
 # Aplicar K-means
 k_optimo = min(4, len(block_features))
 kmeans = KMeans(n_clusters=k_optimo, random_state=42, n_init='auto')
 final_labels = kmeans.fit_predict(block_features)
 
+# PASO 4: Ordenamiento Semantico de clusteres y reconstrucción de la aatriz
 
-# PASO 4: Preparar las matrices para visualización
+# 4.1 Obtener los centroides de K-means
+centroides = kmeans.cluster_centers_
 
-row_indices = np.argsort(model.row_labels_)
-col_indices = np.argsort(model.column_labels_)
+# 4.2 Encontrar el orden correcto basado unicamente en la primera columna
+indices_ordenados_por_media = np.argsort(centroides[:, 0])
 
-# ANTES
-X_reordered = X[row_indices, :][:, col_indices]
+# 4.3 Crear un diccionario de mapeo:
+# El clúster con menor media recibirá el valor 0 (Very Low), el mayor recibirá 3 (High)
+mapeo_semantico = {id_original: nivel_ordenado for nivel_ordenado, id_original in enumerate(indices_ordenados_por_media)}
 
-# DESPUÉS
+# 4.4 Aplicar el mapeo a nuestras etiquetas de bloques para ordenarlas
+final_labels_ordered = np.array([mapeo_semantico[label] for label in final_labels])
+
+# 4.5 Reconstrucción de la matriz discretizada
 X_kmeans = np.zeros_like(X, dtype=float)
 block_idx = 0
 
@@ -194,30 +220,51 @@ for r in range(n_row_clusters):
     for c in range(n_col_clusters):
         filas = np.where(model.row_labels_ == r)[0]
         cols = np.where(model.column_labels_ == c)[0]
+        nivel_semantico = final_labels_ordered[block_idx]
+        
         for f in filas:
             for cl in cols:
-                X_kmeans[f, cl] = final_labels[block_idx]
+                X_kmeans[f, cl] = nivel_semantico
         block_idx += 1
 
+# Reordenamos ambas matrices para la visualización en checkerboard
+row_indices = np.argsort(model.row_labels_)
+col_indices = np.argsort(model.column_labels_)
+
+X_reordered = X[row_indices, :][:, col_indices]
 X_kmeans_reordered = X_kmeans[row_indices, :][:, col_indices]
 
-# PASO 5: Graficar
+
+# PASO 5: graficacion con escala semantica categorica
 
 fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
-# Gráfico 1
-sns.heatmap(X_reordered, cmap="viridis", ax=axes[0], cbar_kws={'label': 'Niveles de NO2'})
+# Gráfico 1: Valores Crudos Co-Agrupados
+sns.heatmap(X_reordered, cmap="viridis", ax=axes[0], cbar_kws={'label': 'Niveles de NO2 (µg/m³)'})
 axes[0].set_title("ANTES: Co-Clustering Checkerboard\n(Valores crudos agrupados)")
-axes[0].set_xlabel("Días")
+axes[0].set_xlabel("Días / Horas")
 axes[0].set_ylabel("Códigos Postales (Regiones)")
 
 if num_tiempos > 20: axes[0].set_xticks([]) 
 if num_regiones > 20: axes[0].set_yticks([])
 
-# Gráfico 2
-sns.heatmap(X_kmeans_reordered, cmap="Set1", ax=axes[1], cbar_kws={'label': 'Patrón K-means'})
-axes[1].set_title("DESPUÉS: Refinamiento con K-means\n(Discretizado en comportamientos)")
-axes[1].set_xlabel("Días")
+# Gráfico 2: Refinamiento Discretizado Ordenado (Non-Checkerboard)
+# Usamos un mapa de color secuencial y configuramos la barra de color con etiquetas textuales
+escalas_color = ["#2b83ba", "#abdda4", "#fdae61", "#d7191c"] # Azul (Muy bajo) a Rojo (Alto)
+cmap_categorico = sns.color_palette(escalas_color, as_cmap=True)
+
+# Dibujamos el mapa de calor asegurando que los límites numéricos sean estrictamente de 0 a 3
+heatmap_kmeans = sns.heatmap(X_kmeans_reordered, 
+                             cmap=cmap_categorico, 
+                             ax=axes[1], 
+                             vmin=-0.5, vmax=3.5,
+                             cbar=False) 
+cbar = fig.colorbar(heatmap_kmeans.collections[0], ax=axes[1], ticks=[0, 1, 2, 3])
+cbar.set_ticklabels(['Very Low', 'Low', 'Medium', 'High'])
+cbar.set_label('Estados de Contaminación de NO2')
+
+axes[1].set_title("DESPUÉS: Refinamiento con K-means\n(Discretizado en comportamientos ordenados)")
+axes[1].set_xlabel("Días / Horas")
 axes[1].set_ylabel("Códigos Postales (Regiones)")
 
 if num_tiempos > 20: axes[1].set_xticks([])

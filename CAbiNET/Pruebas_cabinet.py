@@ -25,32 +25,45 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     expected = np.outer(r, c)
     S = (P - expected) / np.sqrt(expected)
     
-    svd = TruncatedSVD(n_components=K_dims)
+    svd = TruncatedSVD(n_components=K_dims, random_state=42)
     U = svd.fit_transform(S) 
     V = svd.components_.T    
     alpha = svd.singular_values_
-    
-    G_estaciones = U 
-    G_dias = V * alpha
+
+    # Ajuste por masas marginales para preservar la distancia Chi-cuadrado
+    U_scaled = U / np.sqrt(r)[:, np.newaxis]
+    V_scaled = V / np.sqrt(c)[:, np.newaxis]
+
+    #Extraemos las coordenadas según el principio de cabinet
+    G_estaciones_principal = U_scaled * alpha
+    G_dias_estandar = V_scaled
     
     # PASO 2: Construcción del Grafo Bimodal (Espacio-Tiempo) inicial
     nn_est = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
-    nn_est.fit(G_estaciones)
-    adj_est_est = nn_est.kneighbors_graph(G_estaciones, mode='connectivity')
+    nn_est.fit(G_estaciones_principal)
+    adj_est_est = nn_est.kneighbors_graph(G_estaciones_principal, mode='connectivity')
     
     nn_dia = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
-    nn_dia.fit(G_dias)
-    adj_dia_dia = nn_dia.kneighbors_graph(G_dias, mode='connectivity')
+    nn_dia.fit(G_dias_estandar)
+    adj_dia_dia = nn_dia.kneighbors_graph(G_dias_estandar, mode='connectivity')
     
-    association_matrix = np.dot(G_estaciones, V.T) 
-    
+
+    # Producto interno para el Association Ratio
+    association_matrix = np.dot(G_estaciones_principal, G_dias_estandar.T)
     adj_est_dia = np.zeros_like(association_matrix)
+
+    # Top-k días más cercanos a cada estación (por filas)
     for i in range(association_matrix.shape[0]):
-        top_k_indices = np.argsort(association_matrix[i])[-k_neighbors:]
-        adj_est_dia[i, top_k_indices] = 1
+        top_k_dias = np.argsort(association_matrix[i, :])[-k_neighbors:]
+        adj_est_dia[i, top_k_dias] = 1
+
+    # Top-k estaciones más cercanas a cada día (por columnas)
+    for j in range(association_matrix.shape[1]):
+        top_k_estaciones = np.argsort(association_matrix[:, j])[-k_neighbors:]
+        adj_est_dia[top_k_estaciones, j] = 1
         
-    n_est = G_estaciones.shape[0]
-    n_dias = G_dias.shape[0]
+    n_est = G_estaciones_principal.shape[0]
+    n_dias = G_dias_estandar.shape[0]
     n_total = n_est + n_dias
     
     global_adj = np.zeros((n_total, n_total))
@@ -77,7 +90,7 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     with np.errstate(divide='ignore', invalid='ignore'):
         snn_jaccard = np.where(union > 0, intersection / union, 0.0)
     
-    # Poda (Thresholding) de las aristas débiles
+    # Poda de las aristas débiles
     snn_jaccard[snn_jaccard < jaccard_threshold] = 0.0
     
     # Removemos la diagonal para evitar que los auto-bucles afecten a Leiden
@@ -97,8 +110,8 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     dist_matrix = 1.0 - snn_jaccard
     np.fill_diagonal(dist_matrix, 0.0) # La distancia hacia sí mismo es 0
     
-    # Configuramos UMAP para recibir directamente la matriz de distancias precalculada
-    reducer = umap.UMAP(n_neighbors=k_neighbors, min_dist=0.1, metric='precomputed')
+    # Deja que UMAP explore vecindarios más amplios sobre la matriz de distancia SNN
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='precomputed', random_state=42)
     embedding_2d = reducer.fit_transform(dist_matrix)
     
     # Plotting (Sin cambios)
@@ -123,18 +136,22 @@ def cabinet_air_quality_baseline(X_matrix, K_dims=10, k_neighbors=5, jaccard_thr
     return clusters, embedding_2d
 
 
-df = pd.read_csv("D:/UCSP/Proyecto_final_de_carrera/Posibles_papers/a_implementar/AirQualityPACA_Data-master/data_polmet.csv", sep=";", decimal=",")
+df = pd.read_csv("D:/UCSP/Proyecto_final_de_carrera/Posibles_papers/a_implementar/DATA_sintetica/experimento_base_4x5.csv", 
+                 sep=";", 
+                 dtype={'cp': str}, 
+                 low_memory=False)
 
 df['date'] = pd.to_datetime(df['date'])
 
 # Pivotear la tabla para armar la Matriz Espaciotemporal
 # Filas = 'cp' (Espacio), Columnas = 'date' (Tiempo), Valores = 'max_NO2max'
-matriz_df = df.pivot(index='cp', columns='date', values='max_NO2max')
+matriz_df = df.pivot(index='cp', columns='date', values='valor_sintetico')
 
 
 # 1. Prioridad: Imputar con la media de cada estación (fila) a lo largo del tiempo.
 # Esto asume que el comportamiento en un día faltante se asemeja al promedio de ese sensor.
 matriz_df = matriz_df.apply(lambda row: row.fillna(row.mean()), axis=1)
+
 
 # 2. Respaldo de seguridad: Si alguna estación tuviera 100% de NaNs (sin datos), 
 # la media de la fila también sería NaN. Para evitar que el SVD falle, 
@@ -142,6 +159,13 @@ matriz_df = matriz_df.apply(lambda row: row.fillna(row.mean()), axis=1)
 if matriz_df.isna().sum().sum() > 0:
     media_global = matriz_df.mean().mean()
     matriz_df = matriz_df.fillna(media_global)
+
+#Extraer el Ground Truth alineado exactamente con el orden del pivoteo
+cp_to_gt = df.set_index('cp')['gt_espacial'].to_dict()
+filas_real = np.array([cp_to_gt[cp] for cp in matriz_df.index])
+
+date_to_gt = df.set_index('date')['gt_temporal'].to_dict()
+columnas_real = np.array([date_to_gt[dt] for dt in matriz_df.columns])
 
 # Extraer la matriz pura para el algoritmo y guardar las etiquetas
 X_matrix_real = matriz_df.values
@@ -154,10 +178,10 @@ print(f"¡Matriz lista! Dimensión: {X_matrix_real.shape[0]} zonas espaciales x 
 clusters, proyeccion = cabinet_air_quality_baseline(X_matrix_real)
 
 
-# Separar los clústeres devueltos por el algoritmo
+# Separar los clústeres devueltos por el algoritmo y convertirlos a arreglos de NumPy
 n_estaciones = len(estaciones_nombres)
-clust_est = clusters[:n_estaciones]
-clust_dias = clusters[n_estaciones:]
+clust_est = np.array(clusters[:n_estaciones])
+clust_dias = np.array(clusters[n_estaciones:])
 
 # Reordenar la matriz original (para el panel "ANTES")
 # Obtenemos los índices que ordenarían las estaciones y días por su número de clúster
@@ -193,3 +217,5 @@ axes[1].legend()
 
 plt.tight_layout()
 plt.show()
+
+
